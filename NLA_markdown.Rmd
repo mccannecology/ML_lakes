@@ -1,0 +1,318 @@
+---
+title: "Machine Learning & Lakes"
+output: html_document
+---
+
+<br>
+
+The goal of this analysis is to see if we can predict the concentration of **chlorophyll *a*** (one of the major pigments
+involved in photosynthesis) in a lake. **Chlorophyll *a*** is a good indicator of the amount of phytoplankton in a lake 
+or pond. These are the organisms that are sometimes responsible for a [harmful algal bloom](http://en.wikipedia.org/wiki/Algal_bloom). 
+We'll use a number of predictor variables that are commonly collected in surveys of lakes and ponds to try to predict chlorophyll *a*.
+
+**Predictors:**
+
+- Lake size
+- Shoreline development index (*complexity of the shoreline*)
+- Depth, maximum
+- Day of the year (Julian)
+- Total phosphorus
+- Conductivity 
+- Alkalinity 
+- pH
+- Secchi depth (i.e., water clarity)
+- Dissolved oxygen
+- Temperature 
+
+We'll use a machine learning approach called a [Random Forest](http://en.wikipedia.org/wiki/Random_forest). This method is particularly good for situations 
+where there are non-linear relationships in the data or you don't want to assume a particular probability model. 
+
+We'll be using data from the [U.S. Environmental Protection Agency (EPA) National Lake Assessment](http://water.epa.gov/type/lakes/lakessurvey_index.cfm). This data set 
+includes over 1000 surveys of lakes and ponds across the US in 2007. A more detailed description of the data and 
+direct URLs for downloading can be found [here](http://water.epa.gov/type/lakes/NLA_data.cfm).
+
+<br>
+<br>
+
+# Download & import data 
+First, let's get some data. We'll use the package `RCurl` to download the raw .csv data directly from the EPA's website. 
+We'll download data from three different data sets to get all of the variables that we want. 
+
+```{r}
+
+library(RCurl)
+
+# this contains pH, conductivity, total phosphorus, secchi depth, and chlorophyll a
+URL <- "http://water.epa.gov/type/lakes/assessmonitor/lakessurvey/upload/NLA2007_WaterQuality_20091123.csv"
+X <- getURL(URL, ssl.verifypeer = FALSE)
+data_water_qual <- read.csv(textConnection(X))
+
+# this contains lake size, shoreline development index, and maximum depth 
+URL <- "http://water.epa.gov/type/lakes/assessmonitor/lakessurvey/upload/NLA2007_SampledLakeInformation_20091113.csv"
+X <- getURL(URL, ssl.verifypeer = FALSE)
+data_lake_info <- read.csv(textConnection(X))
+
+# this contains dissolved oxygen and temperature 
+# NOTE: this is the entire depth profile (i.e., multiple readings for each water body surveyed) 
+URL <- "http://water.epa.gov/type/lakes/assessmonitor/lakessurvey/upload/NLA2007_Profile_20091008.csv"
+X <- getURL(URL, ssl.verifypeer = FALSE)
+data_profile <- read.csv(textConnection(X))
+
+rm(list=c("X","URL")) # clean up your workspace
+
+```
+
+<br>
+<br>
+
+# Examine characteristics of the data
+
+Before we start analyzing anything, let's check out some features of the data. 
+First, let's look at all of the variable names. 
+
+```{r}
+
+names(data_water_qual)
+names(data_lake_info)
+names(data_profile)
+
+```
+You can see there actually are a lot of possible predictors in this data set. We'll limit our models for now to some of the most common variables that are collected in lake surveys.
+
+<br>
+Let's also look at the size of these data sets
+```{r}
+
+dim(data_water_qual)
+dim(data_lake_info)
+dim(data_profile)
+
+```
+
+<br>
+Now, let's look at our response variable: chlorophylla *a*. 
+```{r, fig.height=5, fig.width=7.5}
+par(mfrow=c(1,2))
+hist(data_water_qual$CHLA)
+hist(log(data_water_qual$CHLA))
+
+summary(data_water_qual$CHLA)
+
+```
+It looks like there are some pretty extreme values of **chlorophyll *a***.
+
+<br>
+<br>
+
+# Merge data frames 
+Now we're going to combine all of those data sets into one. 
+First, we need to make a unique identifier for the lake and survey date.
+```{r}
+data_water_qual$ID <- paste(data_water_qual$SITE_ID, data_water_qual$DATE_COL, sep="_")
+data_lake_info$ID <- paste(data_lake_info$SITE_ID, data_lake_info$DATE_COL, sep="_")
+data_profile$ID <- paste(data_profile$SITE_ID, data_profile$DATE_PROFILE, sep="_")
+```
+
+If you inspected `data_profile` closer, you would notice  that it 
+has an observation for every depth so let's subset to just get the surface measurements. 
+This way we have just a single observation of dissolved oxygen and temperature for each lake. 
+```{r}
+data_profile <- subset(data_profile, data_profile$DEPTH ==0)
+```
+
+Now, let's merge data frames based on the column `ID`.
+```{r}
+data_merge <- merge(data_water_qual, data_lake_info, by=c("ID")) # merge the first two 
+data_merge <- merge(data_merge, data_profile, by=c("ID")) # then merge the result to the third 
+```
+
+Let's see how many observations we end up with:
+```{r}
+dim(data_merge)
+```
+
+
+<br>
+<br>
+
+# Clean up a few things
+
+Remove any observations that are missing CHLA
+```{r}
+
+data_merge <- data_merge[!rowSums(is.na(data_merge["CHLA"])), ]
+
+```
+
+Determine the Julian day of the year. `strftime()` is a function to convert date formats. We want to go from
+*month/day/year* to the *day of the year*, this way it can be a neat and tidy predictor in our model. 
+```{r}
+
+data_merge$DATE <- strftime(as.Date(data_merge$DATE_COL.x, "%m/%d/%Y"), format = "%j")
+data_merge$DATE <- as.numeric(data_merge$DATE)
+
+```
+<br>
+<br>
+
+# Split data into training and testing sets 
+
+We're going to train the model on a portion of the data and then test it on the remainder.
+Use the `createDataPartition()` function the package `caret`. Use the argument `p` to Split the data into 75% of the 
+observations for training the model and the rest for testing. 
+
+```{r}
+
+library(caret)
+
+inTrain <- createDataPartition(y=data_merge$CHLA, p=0.75, list=FALSE) # use 75% of data to train to the model 
+training <- data_merge[inTrain,]
+testing <- data_merge[-inTrain,]
+
+```
+<br>
+<br>
+
+# Plotting univariate relationships 
+Before we get into a more complicated analyis 
+let's check out some of the relationships between each of the single predictors and **chlorophyll *a***. 
+```{r fig.width=3, fig.height=3}
+
+library(ggplot2)
+
+predict_vars <- c("SECMEAN","PH_LAB","COND","PTL","TEMP_FIELD","DO_FIELD","DEPTHMAX","LAKEAREA","SLD","DATE")
+
+for(i in unique(predict_vars)){
+  plots <- ggplot(training,aes_string(y="CHLA",x=i)) + geom_point(alpha=0.4)
+  plots <- plots + scale_x_log10() + scale_y_log10()
+  print(plots)
+}
+```
+
+It looks like some of the predictors have a pretty linear relationship with **chlorophyll *a***.
+Those will probably be good predictors. 
+
+<br>
+<br>
+
+# Fit a random forest 
+Now we're actually going to fit a Random Forest. We'll use the package `caret` again. `caret` is a nice wrapper package for 
+many machine learning techniques. There are lots of othe packages for random forests and `caret` will actually call `randomForest` directly. 
+```{r}
+
+library(caret)
+
+set.seed(12321)
+
+modFit_RF <- train(CHLA ~ SECMEAN + PH_LAB + COND + PTL + TEMP_FIELD + DO_FIELD + DEPTHMAX + 
+                     LAKEAREA + SLD + DATE, 
+                   method="rf", 
+                   data=training)
+
+finMod_RF <- modFit_RF$finalModel
+print(modFit_RF)
+
+```
+We just tuned the model to pick the optimal parametr for `mtry` which is the number of variables randomly sampled to use
+at each split in the tree. We did this by bootstraping our data (i.e., resampling with replacement), trying different values for `mtry`, and finding the optimal value by minimizing the RMSE (root mean square error, a measure of accuracy).
+
+<br>
+Let's look at the results from the final model:
+```{r}
+print(finMod_RF)
+```
+
+<br>
+And here are the most important variables:
+```{r}
+finMod_RF$importance
+```
+As expected, the **water clarity** (average secchi depth or `SECMEAN`) and **nutrients** (total phosphorus or `PTL`)
+are important predictors of **chlorophyll *a***. It wasn't obvious from the bivariate plots, but it looks like **dissolved oxygen** (`DO_FIELD`) is also an important predictor. 
+
+<br>
+<br>
+
+# Observed vs. predicted chlorophyll a 
+
+Let's see how well the Random Forest did. First, we need to remove the test cases that have missing predictors 
+```{r}
+
+cols <- c("SECMEAN","PH_LAB","COND","PTL","TEMP_FIELD","DO_FIELD","DEPTHMAX","LAKEAREA","SLD","DATE")
+testing <- testing[!rowSums(is.na(testing[cols])), ]
+
+```
+
+Make predictions and add them to to the testing data frame 
+```{r}
+testing$pred_RF <- predict(modFit_RF, testing)
+```
+
+Calculate the root mean square error (RMSE) on the testing data 
+```{r}
+
+sqrt(sum((testing$pred_RF - testing$CHLA)^2))
+
+```
+
+<br>
+**Plot it**
+```{r}
+plot_RF_log <- ggplot(testing, aes(x=CHLA, y=pred_RF)) + geom_point(size=2) 
+plot_RF_log <- plot_RF_log + geom_abline(slope=1,intercept=0,size=1,colour="red")
+plot_RF_log <- plot_RF_log + xlab("Observed chl a") + ylab("Predicted chl a")
+plot_RF_log <- plot_RF_log + theme_classic(base_size=18)
+plot_RF_log <- plot_RF_log + expand_limits(x=0, y=0)
+plot_RF_log <- plot_RF_log + scale_x_log10(expand=c(0,0)) + scale_y_log10(expand=c(0,0)) 
+plot_RF_log
+```
+
+Not bad. Not great. Most observations are along the 1:1 line in red which would mean the predictions 
+match the observations. Notice, there definitely are some cases where our predictions are way off from observed values. 
+It also looks like there is a tendency for the random forest to predict values that are **higher** than observed. 
+
+<br>
+<br>
+
+# Parallel Processing 
+While this data set is not huge (>1000 observations), fitting Random Forests on large data sets can be slow. 
+Therefore, it's often helpful to fit your model using all of the cores on your machine (by default R will only use one core).
+
+There are several packages which allow for parallel processing in R. These include `doSNOW`, `doMC`, `foreach`, and many others. For this example, I will use `doSNOW`. 
+
+```{r, eval=FALSE}
+library(caret)
+library(doSNOW)
+
+cl <- makeCluster(4, type="SOCK") # set-up the cluster 
+registerDoSNOW(cl)
+
+# fit the model 
+modFit_RF_par <- train(CHLA ~ SECMEAN + PH_LAB + COND + PTL + TEMP_FIELD + DO_FIELD + 
+                         DEPTHMAX + LAKEAREA + SLD + DATE, 
+                   method="rf", 
+                   data=training)
+
+stopCluster(cl)
+
+```
+
+<br>
+<br>
+
+
+# Even bigger data 
+While 1200 or so observations might be pretty big for ecology, data sets can get a lot bigger! `R` doesn't necessarily do a great job at dealing with huge data sets (e.g., 100,000s of rows). Two common packages used to jump this hurdle are `bigmemory` and `ff`. They both allow large datasets to be stored on the disk, rather than in RAM. 
+
+<br>
+Here's what it would look like if you wanted to repeat the data inport step with `ff`: 
+```{r, eval=FALSE}
+library(ff)
+
+URL <- "http://water.epa.gov/type/lakes/assessmonitor/lakessurvey/upload/NLA2007_WaterQuality_20091123.csv"
+X <- getURL(URL, ssl.verifypeer = FALSE)
+data_water_qual <- read.table.ffdf(file=textConnection(X), FUN="read.csv")
+```
+
+<br>
+<br>
